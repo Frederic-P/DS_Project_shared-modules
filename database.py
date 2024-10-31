@@ -38,13 +38,71 @@ class Database:
             self.connection = None
             print("Connection closed")
 
+    def update_processed_entry(self, unix_upload_time, days_online, views, tagcount, groupcount, statusflag, pkid, stored_at):
+        query = """UPDATE image_entries 
+        SET state = %s, 
+        groupcount = %s, 
+        tagcount = %s, 
+        uploaddate = %s, 
+        days_online_at_scrape = %s, 
+        viewcount = %s, 
+        storage_location = %s
+        WHERE pk_id = %s"""
+        args = [statusflag, groupcount, tagcount, unix_upload_time, days_online, views, stored_at, pkid]
+        res = self.execute_query(query, args)
+        
+    
+
+    def save_groups(self, groups, pkid):
+        for group in groups: 
+            title = group['title']
+            id = group['id']
+            exists_query = "SELECT id FROM `flickr_groups` WHERE flickr_group_id = %s"
+            exists_param = [id]
+            exists_result = self.execute_query(exists_query, exists_param)
+            if len(exists_result) == 0:
+                #group does not exist yet; create it!
+                create_query = "INSERT INTO `flickr_groups` (`group_name`, `flickr_group_id`) VALUES (%s, %s)"
+                create_params = [title, id]
+                groupid_pk = self.execute_query(create_query, create_params, True)
+            else:
+                groupid_pk = exists_result[0]['id']
+            relation_query = "INSERT INTO `grouprelations` (`pk_of_group`,`pk_of_img_entry`) VALUES (%s, %s)"
+            relation_params = [groupid_pk, pkid]
+            self.execute_query(relation_query, relation_params)
+
+    def save_tags(self, tags, pkid):
+        for tag in tags['tags']:
+            raw_tag = tag['raw']
+            norm_tag = tag['_content']
+            exists_query = "SELECT id FROM `normalized_tags` WHERE normalized = %s"
+            exists_param = [norm_tag]
+            exists_result = self.execute_query(exists_query, exists_param)
+            if len(exists_result) == 0:
+                #tag does not exist yet; create it!
+                create_query = "INSERT INTO `normalized_tags` (`normalized`, `bad_tag`) VALUES (%s, %s)"
+                create_params = [norm_tag, 0]
+                tag_pk = self.execute_query(create_query, create_params, True)
+            else:
+                tag_pk = exists_result[0]['id']
+            relation_query = "INSERT INTO `tagrelations` (`pk_of_norm_tag`,`pk_of_img_entry`) VALUES (%s, %s)"
+            relation_params = [tag_pk, pkid]
+            self.execute_query(relation_query, relation_params)
+            #with the normalized PK known: also store the spelling variant: 
+            #   variants are ai_ci collated so there's some wiggleroom.
+            variant_exists_query = "SELECT count(*) as f FROM tag_variants WHERE normalized_tag_id = %s AND tag_as_written = %s"
+            variant_exists_param = [tag_pk, raw_tag]
+            variant_exists_result = self.execute_query(variant_exists_query, variant_exists_param)
+            if variant_exists_result[0]['f'] == 0:
+                create_variant_query = "INSERT INTO `tag_variants` (`normalized_tag_id`,`tag_as_written`) VALUES (%s, %s)"
+                self.execute_query(create_variant_query, variant_exists_param)
+
     def start_transaction(self):
         """Start a new transaction."""
         self.connect()
         if self.connection:
             try:
                 self.connection.begin()
-                print("Transaction started")
             except pymysql.MySQLError as e:
                 print(f"Error starting transaction: {e}")
 
@@ -53,7 +111,6 @@ class Database:
         if self.connection:
             try:
                 self.connection.commit()
-                print("Transaction committed")
             except pymysql.MySQLError as e:
                 print(f"Error committing transaction: {e}")
                 self.connection.rollback()
@@ -83,7 +140,7 @@ class Database:
         """Store the sitemap content in the database."""
         if self.connection:
             try:
-                query = "INSERT INTO `image_entries` (`image_id`, `user_id`, `title`, `image_url`, `status`, `sitemap_source`) VALUES (%s, %s, %s, %s, 'Unprocessed', %s)"
+                query = "INSERT INTO `image_entries` (`image_id`, `user_id`, `title`, `image_url`, `state`, `sitemap_source`) VALUES (%s, %s, %s, %s, 'unprocessed', %s)"
                 with self.connection.cursor() as cursor:
                     for _, row in data.iterrows():
                         data = [row['imid'], row['user'], row['title'], row['image_loc'], sitemap_pk_id]
@@ -102,7 +159,7 @@ class Database:
                     results = cursor.fetchall()
                     return results
 
-    def execute_query(self, query, params=None):
+    def execute_query(self, query, params=None, return_rowid = False):
         """Execute a query and return the results."""
         self.connect()
         if self.connection:
@@ -110,7 +167,10 @@ class Database:
                 with self.connection.cursor() as cursor:
                     cursor.execute(query, params)
                     results = cursor.fetchall()
-                return results
+                if return_rowid:
+                    return cursor.lastrowid
+                else:
+                    return results
             except pymysql.MySQLError as e:
                 print(f"Error executing query: {e}")
                 return None
@@ -122,24 +182,19 @@ class Database:
             try:
                 with self.connection.cursor() as cursor:
                     cursor.execute(query, params)
-                print("Query executed successfully")
             except pymysql.MySQLError as e:
                 print(f"Error executing update: {e}")
                 self.connection.rollback()
 
-    def get_random_n_images(self, n=100):
+    def get_random_n_images(self, sitemap_id, n=100):
         """Get a random set of n image ids from the database.
         Since the volume is too big to randomly select on millions of
         records there first happens a random selection of the sitemap
         pk_id to randomly select within a randomly chosen subset."""
-        random_subset_query = "SELECT max(pk_id) AS upperlimit FROM sitemaps"
-        random_images_in_subset = "SELECT * FROM image_entries WHERE sitemap_source = %s AND status = %s ORDER BY rand() LIMIT %s"
+        random_images_in_subset = "SELECT pk_id, image_id, image_url FROM image_entries WHERE sitemap_source = %s AND state = %s AND is_duplicate = 0 ORDER BY rand() LIMIT %s"
         if self.connection:
             with self.connection.cursor() as cursor: 
-                cursor.execute(random_subset_query)
-                maxid = cursor.fetchall()
-                maxid = maxid[0]['upperlimit']
-                img_query_data = [maxid, 'Unprocessed', int(n)]
+                img_query_data = [sitemap_id, 'unprocessed', int(n)]
                 cursor.execute(random_images_in_subset, img_query_data)
                 results = cursor.fetchall()
                 return results
